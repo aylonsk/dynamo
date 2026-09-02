@@ -34,6 +34,13 @@ from dynamo.sglang.engine_generate import (
     native_generate_payload,
     native_generate_stream,
 )
+from dynamo.sglang.parallel_sampling import (
+    choice_request_id,
+    merge_choice_streams,
+    requested_parallel_samples,
+    resolve_decode_bootstrap_rooms,
+    single_sample_params,
+)
 from dynamo.sglang.publisher import DynamoSglangPublisher
 from dynamo.sglang.request_handlers.handler_base import BaseWorkerHandler
 from dynamo.sglang.request_handlers.llm.mm_disagg_utils import (
@@ -513,9 +520,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             bootstrap_host=bootstrap_info.get("bootstrap_host"),
             bootstrap_port=bootstrap_info.get("bootstrap_port"),
             bootstrap_room=bootstrap_info.get("bootstrap_room"),
-            external_trace_header=context.trace_headers()
-            if self.enable_trace
-            else None,
+            external_trace_header=(
+                context.trace_headers() if self.enable_trace else None
+            ),
             routed_dp_rank=routing.get("dp_rank"),
             lora_path=self._resolve_lora(request),
         )
@@ -584,11 +591,21 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                     "bootstrap_info is required for disaggregated decode but was not provided"
                 )
 
+            # SGLang cannot pair parallel samples across a PD handoff, so an
+            # n > 1 request runs as n single-sample sub-requests, one room
+            # each, merged back by choice index below (see
+            # dynamo.sglang.parallel_sampling). An older frontend supplies a
+            # single room for n > 1 and is rejected with HTTP 400 here.
+            num_choices = requested_parallel_samples(sampling_params)
+            bootstrap_rooms = resolve_decode_bootstrap_rooms(
+                bootstrap_info, num_choices
+            )
+
             logging.debug(
                 f"Using bootstrap_info: "
                 f"host={bootstrap_info['bootstrap_host']}, "
                 f"port={bootstrap_info['bootstrap_port']}, "
-                f"room={bootstrap_info['bootstrap_room']}"
+                f"rooms={bootstrap_rooms}"
             )
 
             trace_header = context.trace_headers() if self.enable_trace else None
@@ -600,42 +617,76 @@ class DecodeWorkerHandler(BaseWorkerHandler):
             # Decode re-extracts the media so its token layout matches prefill's
             # and the transferred KV lines up.
             decode_mm_kwargs = build_disagg_mm_kwargs(request)
+            reasoning_kwargs = require_reasoning_kwargs(self.engine, request)
+            if num_choices > 1:
+                sampling_params = single_sample_params(sampling_params)
 
-            decode = await self.engine.async_generate(
-                **input_param,
-                **decode_mm_kwargs,
-                sampling_params=sampling_params,
-                stream=True,
-                **require_reasoning_kwargs(self.engine, request),
-                **self._routed_experts_kwargs,
-                bootstrap_host=bootstrap_info["bootstrap_host"],
-                bootstrap_port=bootstrap_info["bootstrap_port"],
-                bootstrap_room=bootstrap_info["bootstrap_room"],
-                external_trace_header=trace_header,
-                rid=trace_id,
-                data_parallel_rank=dp_rank,
-                lora_path=lora_path,
-                **logprob_kwargs,
-                **priority_kwargs,
-            )
-            if not self.use_sglang_tokenizer:
-                async for out in self._process_token_stream(
-                    decode,
-                    context,
-                    return_tokens_as_token_ids,
-                    user_stop_token_ids=user_stop_token_ids,
-                    suppressed_stop_token_ids=suppressed_stop_token_ids,
-                    metadata_uploader=metadata_uploader,
-                ):
+            decode_streams = []
+            for choice_index, bootstrap_room in enumerate(bootstrap_rooms):
+                decode_streams.append(
+                    await self.engine.async_generate(
+                        **input_param,
+                        **decode_mm_kwargs,
+                        sampling_params=sampling_params,
+                        stream=True,
+                        **reasoning_kwargs,
+                        **self._routed_experts_kwargs,
+                        bootstrap_host=bootstrap_info["bootstrap_host"],
+                        bootstrap_port=bootstrap_info["bootstrap_port"],
+                        bootstrap_room=bootstrap_room,
+                        external_trace_header=trace_header,
+                        rid=(
+                            trace_id
+                            if num_choices == 1
+                            else choice_request_id(trace_id, choice_index)
+                        ),
+                        data_parallel_rank=dp_rank,
+                        lora_path=lora_path,
+                        **logprob_kwargs,
+                        **priority_kwargs,
+                    )
+                )
+
+            # A single choice keeps the pre-fan-out stream shape untouched:
+            # SGLang's own indices and response id pass straight through.
+            if num_choices == 1:
+                choice_indices: list[int | None] = [None]
+                response_id = None
+            else:
+                choice_indices = list(range(num_choices))
+                response_id = trace_id or context.id()
+            choice_streams: list[AsyncIterator[Dict[str, Any]]] = []
+            for choice_index, decode in zip(choice_indices, decode_streams):
+                if not self.use_sglang_tokenizer:
+                    choice_streams.append(
+                        self._process_token_stream(
+                            decode,
+                            context,
+                            return_tokens_as_token_ids,
+                            user_stop_token_ids=user_stop_token_ids,
+                            suppressed_stop_token_ids=suppressed_stop_token_ids,
+                            metadata_uploader=metadata_uploader,
+                            choice_index=choice_index,
+                        )
+                    )
+                else:
+                    choice_streams.append(
+                        self._process_text_stream(
+                            decode,
+                            context,
+                            request=request,
+                            user_stop_token_ids=user_stop_token_ids,
+                            metadata_uploader=metadata_uploader,
+                            choice_index=choice_index,
+                            response_id=response_id,
+                        )
+                    )
+
+            if num_choices == 1:
+                async for out in choice_streams[0]:
                     yield out
             else:
-                async for out in self._process_text_stream(
-                    decode,
-                    context,
-                    request=request,
-                    user_stop_token_ids=user_stop_token_ids,
-                    metadata_uploader=metadata_uploader,
-                ):
+                async for out in self._merge_choice_outputs(choice_streams):
                     yield out
         else:
             raise_if_unextracted_multimodal(request)
@@ -722,6 +773,31 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 ):
                     yield out
 
+    @staticmethod
+    async def _merge_choice_outputs(
+        choice_streams: List[AsyncIterator[Dict[str, Any]]],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Interleave the per-choice sub-streams of a fanned-out n > 1 decode.
+
+        Each sub-stream already stamps its own choice index. Only the usage
+        block needs fixing up: a sub-stream reports its own completion count,
+        while the single-stream n > 1 path reports the request-wide total in
+        every finishing chunk, so the same running total is restored here.
+        """
+        completion_tokens_per_choice: dict[int, int] = {}
+        async for choice_index, out in merge_choice_streams(choice_streams):
+            completion_usage = out.get("completion_usage")
+            if completion_usage is not None:
+                completion_tokens_per_choice[choice_index] = completion_usage[
+                    "completion_tokens"
+                ]
+                request_completion_tokens = sum(completion_tokens_per_choice.values())
+                completion_usage["completion_tokens"] = request_completion_tokens
+                completion_usage["total_tokens"] = (
+                    completion_usage["prompt_tokens"] + request_completion_tokens
+                )
+            yield out
+
     async def _process_native_generate_stream(
         self,
         stream_source: AsyncIterator[Dict[str, Any]],
@@ -754,6 +830,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         user_stop_token_ids: set[int] | None = None,
         suppressed_stop_token_ids: set[int] | None = None,
         metadata_uploader: MetadataUploader | None = None,
+        choice_index: int | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process token-based stream output.
 
@@ -763,6 +840,9 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         Args:
             stream_source: Async generator from engine.async_generate.
             context: Context object for cancellation handling.
+            choice_index: Choice this stream produces when it is one fanned-out
+                sub-request of a disaggregated n > 1 request. SGLang sees such a
+                sub-request as n=1 and reports every chunk as choice 0.
 
         Yields:
             Dict with token_ids and optional finish_reason.
@@ -790,7 +870,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 # The loop should exit by itself when context.is_stopped() returns True.
                 # SGLang omits index for non-n/legacy chunks; treat those as
                 # choice 0 while preserving explicit indices for n>1.
-                output_idx = res.get("index") or 0
+                if choice_index is not None:
+                    output_idx = choice_index
+                else:
+                    output_idx = res.get("index") or 0
 
                 out: dict[str, Any] = {"index": output_idx}
                 finish_reason = meta_info["finish_reason"]
@@ -946,12 +1029,20 @@ class DecodeWorkerHandler(BaseWorkerHandler):
         request: Dict[str, Any] | None = None,
         user_stop_token_ids: set[int] | None = None,
         metadata_uploader: MetadataUploader | None = None,
+        choice_index: int | None = None,
+        response_id: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process text-based stream output in OpenAI format.
 
         Args:
             stream_source: Async generator from engine.async_generate.
             context: Context object for cancellation handling.
+            choice_index: Choice this stream produces when it is one fanned-out
+                sub-request of a disaggregated n > 1 request; SGLang reports
+                such a sub-request as choice 0.
+            response_id: Response id to stamp on every chunk instead of the
+                sub-request's own SGLang id, so the sibling sub-streams of one
+                request share a single id.
 
         Yields:
             OpenAI-formatted chat completion chunk dicts.
@@ -982,7 +1073,10 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 # The loop should exit by itself when context.is_stopped() returns True.
 
                 # Same defaulting as token mode: non-n chunks are choice 0.
-                index = res.get("index") or 0
+                if choice_index is not None:
+                    index = choice_index
+                else:
+                    index = res.get("index") or 0
 
                 text = res.get("text", "")
 
@@ -1029,7 +1123,7 @@ class DecodeWorkerHandler(BaseWorkerHandler):
                 )
 
                 response = {
-                    "id": meta_info["id"],
+                    "id": response_id if response_id is not None else meta_info["id"],
                     "created": int(time.time()),
                     "choices": [choice_data],
                     "model": self.config.server_args.served_model_name,

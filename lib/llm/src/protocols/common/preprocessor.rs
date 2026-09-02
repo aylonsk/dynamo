@@ -101,6 +101,16 @@ pub struct BootstrapInfo {
     /// Unique room ID for this request's KV transfer session
     pub bootstrap_room: u64,
 
+    /// One room per choice for an `n > 1` disaggregated request. SGLang's
+    /// parallel sampling cannot share a room across choices in PD mode, so
+    /// the SGLang worker fans such a request out into `n` single-sample
+    /// sub-requests, each pairing on its own room. Every room satisfies the
+    /// same `room % dp_size == dp_rank` invariant as `bootstrap_room`, which
+    /// is always the first entry. Absent for `n == 1`, so the single-choice
+    /// wire format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_rooms: Option<Vec<u64>>,
+
     /// Stable mocker lifecycle identity. Role, backend, and wire version are
     /// validated by the bootstrap registration and framing protocol.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -657,11 +667,14 @@ mod tests {
             bootstrap_host: "127.0.0.1".to_string(),
             bootstrap_port: 1234,
             bootstrap_room: 7,
+            bootstrap_rooms: None,
             handoff_id: Some(handoff_id),
         };
 
         let value = serde_json::to_value(&info).unwrap();
         assert_eq!(value["handoff_id"], handoff_id.to_string());
+        // `n == 1` requests keep the pre-fan-out wire format.
+        assert!(value.get("bootstrap_rooms").is_none());
         assert!(value.get("mocker_handoff_protocol_version").is_none());
         assert!(value.get("mocker_handoff_role").is_none());
         assert!(value.get("mocker_handoff_engine_type").is_none());
@@ -671,6 +684,32 @@ mod tests {
                 .handoff_id,
             Some(handoff_id)
         );
+    }
+
+    #[test]
+    fn bootstrap_info_round_trips_per_choice_rooms() {
+        let info = BootstrapInfo {
+            bootstrap_host: "127.0.0.1".to_string(),
+            bootstrap_port: 1234,
+            bootstrap_room: 8,
+            bootstrap_rooms: Some(vec![8, 16, 24]),
+            handoff_id: None,
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["bootstrap_room"], 8);
+        assert_eq!(value["bootstrap_rooms"], serde_json::json!([8, 16, 24]));
+        let decoded: BootstrapInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.bootstrap_rooms, Some(vec![8, 16, 24]));
+
+        // A worker or frontend that predates the field deserializes cleanly.
+        let legacy: BootstrapInfo = serde_json::from_value(serde_json::json!({
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": 1234,
+            "bootstrap_room": 8,
+        }))
+        .unwrap();
+        assert_eq!(legacy.bootstrap_rooms, None);
     }
 
     /// Covers the `is_probe` serde contract end-to-end: `rename = "_HEALTH_CHECK"`,

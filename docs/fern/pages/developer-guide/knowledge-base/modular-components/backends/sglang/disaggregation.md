@@ -82,6 +82,14 @@ sequenceDiagram
 7. **Decode phase**: Decode worker generates tokens using the transferred KV cache
 8. **Streaming**: Tokens are streamed back to the client as they're generated
 
+### Parallel Sampling (`n > 1`)
+
+SGLang cannot pair parallel samples across a prefill-decode handoff: its scheduler clones one bootstrap room for every sample, so prefill registers a single sender while decode waits for `n` receivers and the request never completes. Dynamo keeps SGLang blind to `n` in disaggregated mode instead:
+
+- The frontend's prefill router draws one bootstrap room per choice and carries them as `bootstrap_info.bootstrap_rooms`, alongside the single `bootstrap_room` that older workers read. Every room keeps the `room % dp_size == dp_rank` invariant the decode receiver checks.
+- The prefill and decode workers turn the request into `n` independent `n=1` sub-requests, one room each, and the decode worker merges the sub-streams back into one multi-choice response.
+- The single-choice wire format is unchanged. A frontend that predates per-choice rooms sends one room only, and the worker rejects its `n > 1` requests with HTTP 400 rather than hanging. The dedicated multimodal prefill and decode workers still reject `n > 1`.
+
 ### Performance Characteristics
 
 - **RDMA transfer**: Zero-copy GPU-to-GPU transfer with minimal CPU involvement

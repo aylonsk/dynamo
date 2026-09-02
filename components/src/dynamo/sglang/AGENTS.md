@@ -193,6 +193,16 @@ Prefill and decode workers coordinate via a bootstrap mechanism:
 Key functions: `BaseWorkerHandler._get_bootstrap_info()`,
 `BaseWorkerHandler._generate_bootstrap_room()`.
 
+**Parallel sampling (`n > 1`)**: SGLang cannot pair parallel samples across a PD
+handoff (its scheduler clones one room for every sample, so the request hangs after
+prefill — ai-dynamo/dynamo#14098). `parallel_sampling.py` keeps SGLang blind to `n` in
+PD mode: the frontend's prefill router draws one room per choice
+(`bootstrap_info.bootstrap_rooms`, always alongside the single `bootstrap_room`), the
+prefill and decode handlers fan the request out into `n` independent `n=1`
+sub-requests, and `DecodeWorkerHandler._merge_choice_outputs()` interleaves the
+sub-streams by choice index. An older frontend sends only one room and its `n > 1`
+requests get HTTP 400; the dedicated multimodal PD workers reject `n > 1` outright.
+
 ## Metrics & Publishing
 
 `publisher.py:DynamoSglangPublisher` manages:

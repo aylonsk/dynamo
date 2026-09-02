@@ -16,6 +16,7 @@ from dynamo.common.multimodal import EMBEDDING_RECEIVER_FACTORIES, TransferReque
 from dynamo.common.utils import nvtx_utils as _nvtx
 from dynamo.common.utils.engine_response import normalize_finish_reason
 from dynamo.sglang.args import Config
+from dynamo.sglang.parallel_sampling import reject_disagg_parallel_sampling
 from dynamo.sglang.protocol import (
     DisaggSglangMultimodalRequest,
     SglangMultimodalRequest,
@@ -535,6 +536,9 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
             raise ValueError("input_ids is required")
 
         sampling_params = SglangUtils.build_sampling_params(request)
+        # The multimodal PD path still pairs one room per request, so n > 1
+        # would hang the way ai-dynamo/dynamo#14098 describes; refuse it here.
+        reject_disagg_parallel_sampling(sampling_params)
 
         # Request bootstrap info from prefill worker
         bootstrap_info = await self._get_bootstrap_from_prefill(
@@ -745,6 +749,8 @@ class MultimodalPrefillWorkerHandler(
         try:
             # Validate and parse request
             disagg_request = self._validate_and_parse_disagg_request(disagg_request)
+            # One room per request: parallel sampling is not fanned out here.
+            reject_disagg_parallel_sampling(disagg_request.sampling_params)
 
             rid = context.trace_id or context.id()
             bootstrap_room = self._generate_bootstrap_room()
