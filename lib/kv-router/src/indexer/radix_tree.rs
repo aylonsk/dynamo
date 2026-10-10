@@ -13,7 +13,7 @@ use std::{
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::compressed_radix::{NodeState, append_dump_events};
-use super::{EventWarningKind, MatchDetails, PreBoundEventCounters, WorkerLookupStats};
+use super::{EventWarningKind, MatchDetails, PreBoundEventCounters, ResidentBlockCounts};
 use crate::protocols::*;
 
 pub(crate) type SharedRadixBlock = Rc<RefCell<RadixBlock>>;
@@ -861,12 +861,11 @@ impl RadixTree {
     }
 
     /// Distinct blocks held by each worker rank.
-    pub(crate) fn worker_lookup_stats(&self) -> WorkerLookupStats {
-        WorkerLookupStats::from_worker_block_counts(
-            self.lookup
-                .iter()
-                .map(|(worker, worker_lookup)| (*worker, worker_lookup.len())),
-        )
+    pub(crate) fn resident_block_counts(&self) -> ResidentBlockCounts {
+        self.lookup
+            .iter()
+            .map(|(worker, worker_lookup)| (*worker, worker_lookup.len()))
+            .collect()
     }
 
     #[cfg(test)]

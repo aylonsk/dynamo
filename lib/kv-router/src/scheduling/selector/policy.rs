@@ -384,7 +384,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
         let resident_blocks = self
             .resident_blocks
             .as_ref()
-            .and_then(ResidentBlockCountsHandle::load);
+            .map(ResidentBlockCountsHandle::load);
         select_worker_with_policy(
             self.worker_label,
             state,
@@ -392,7 +392,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
             request,
             eligibility,
             block_size,
-            resident_blocks.as_deref(),
+            resident_blocks
+                .as_ref()
+                .and_then(|counts| counts.as_deref()),
         )
     }
 }
@@ -680,7 +682,7 @@ mod tests {
 
     #[test]
     fn resident_blocks_reach_only_declaring_components() {
-        use crate::indexer::{ResidentBlockCountsHandle, WorkerLookupStats};
+        use crate::indexer::ResidentBlockCountsHandle;
 
         // Worker 8 holds no tracked blocks, which reads as 0 rather than None. Worker ids differ
         // from row indices, so a row-for-worker mix-up fails.
@@ -763,9 +765,7 @@ mod tests {
         ]);
         let request = base_request(16);
         let counts = ResidentBlockCountsHandle::default();
-        counts.publish(
-            WorkerLookupStats::from_worker_block_counts([(WorkerWithDpRank::new(3, 0), 12)]).into(),
-        );
+        counts.publish([(WorkerWithDpRank::new(3, 0), 12)].into_iter().collect());
         let probes = || -> Vec<Box<ResidencyProbe>> {
             vec![
                 Box::new(ResidencyProbe(WorkerInputs::RESIDENT_BLOCKS)),

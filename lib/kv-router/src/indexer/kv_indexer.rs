@@ -15,8 +15,8 @@ use super::{
     ApproximateLruLease, ApproximateLruStats, ApproximateLruTask, ApproximateRetentionConfig,
     ContainsWorkerBlockRequest, DumpRequest, EventKind, FlushRequest, GetWorkersRequest,
     KvIndexerInterface, KvIndexerMetrics, KvRouterError, MatchDetails, MatchDetailsRequest,
-    MatchRequest, PreBoundEventCounters, RadixTree, RoutingDecisionRequest, WorkerLookupStats,
-    WorkerLookupStatsRequest, panic_payload_message,
+    MatchRequest, PreBoundEventCounters, RadixTree, ResidentBlockCounts,
+    ResidentBlockCountsRequest, RoutingDecisionRequest, panic_payload_message,
 };
 use crate::indexer::pruning::{BlockEntry, PruneConfig, WorkerPruneManager};
 use crate::protocols::*;
@@ -339,7 +339,7 @@ pub struct KvIndexer {
     get_workers_tx: mpsc::Sender<GetWorkersRequest>,
     /// A sender for per-rank block count requests.
     #[cfg_attr(not(feature = "standalone-indexer"), allow(dead_code))]
-    worker_lookup_stats_tx: mpsc::Sender<WorkerLookupStatsRequest>,
+    resident_block_counts_tx: mpsc::Sender<ResidentBlockCountsRequest>,
     /// A sender for dump requests.
     dump_tx: mpsc::Sender<DumpRequest>,
     /// A sender for flush requests.
@@ -434,8 +434,8 @@ impl KvIndexer {
         let (remove_worker_dp_rank_tx, remove_worker_dp_rank_rx) =
             mpsc::channel::<(WorkerId, DpRank)>(16);
         let (get_workers_tx, get_workers_rx) = mpsc::channel::<GetWorkersRequest>(16);
-        let (worker_lookup_stats_tx, worker_lookup_stats_rx) =
-            mpsc::channel::<WorkerLookupStatsRequest>(16);
+        let (resident_block_counts_tx, resident_block_counts_rx) =
+            mpsc::channel::<ResidentBlockCountsRequest>(16);
         let (dump_tx, dump_rx) = mpsc::channel::<DumpRequest>(16);
         let (flush_tx, flush_rx) = mpsc::channel::<FlushRequest>(16);
         let (routing_tx, mut routing_rx) = mpsc::channel::<RoutingDecisionRequest>(2048);
@@ -466,7 +466,7 @@ impl KvIndexer {
                     let mut remove_worker_rx = remove_worker_rx;
                     let mut remove_worker_dp_rank_rx = remove_worker_dp_rank_rx;
                     let mut get_workers_rx = get_workers_rx;
-                    let mut worker_lookup_stats_rx = worker_lookup_stats_rx;
+                    let mut resident_block_counts_rx = resident_block_counts_rx;
                     let mut dump_rx = dump_rx;
                     let mut flush_rx = flush_rx;
                     let mut trie = delegate.map_or_else(RadixTree::new, RadixTree::new_with_delegate);
@@ -503,6 +503,11 @@ impl KvIndexer {
                                 if let Some(pm) = &prune_manager {
                                     pm.remove_worker_dp_rank(WorkerWithDpRank::new(worker_id, dp_rank));
                                 }
+                            }
+
+                            // Ahead of mutations and matches: under steady traffic, later arms may never run.
+                            Some(req) = resident_block_counts_rx.recv() => {
+                                let _ = req.resp.send(trie.resident_block_counts());
                             }
 
                             Some(mutation) = mutation_rx.recv() => {
@@ -564,10 +569,6 @@ impl KvIndexer {
                             Some(get_workers_req) = get_workers_rx.recv() => {
                                 let workers = trie.get_workers();
                                 let _ = get_workers_req.resp.send(workers);
-                            }
-
-                            Some(stats_req) = worker_lookup_stats_rx.recv() => {
-                                let _ = stats_req.resp.send(trie.worker_lookup_stats());
                             }
 
                             Some(dump_req) = dump_rx.recv() => {
@@ -667,7 +668,7 @@ impl KvIndexer {
             remove_worker_tx,
             remove_worker_dp_rank_tx,
             get_workers_tx,
-            worker_lookup_stats_tx,
+            resident_block_counts_tx,
             dump_tx,
             flush_tx,
             routing_tx,
@@ -789,16 +790,16 @@ impl KvIndexer {
 
     /// Distinct blocks the tree holds for each worker rank.
     #[cfg_attr(not(feature = "standalone-indexer"), allow(dead_code))]
-    pub(crate) async fn worker_lookup_stats(&self) -> Result<WorkerLookupStats, KvRouterError> {
+    pub(crate) async fn resident_block_counts(&self) -> Result<ResidentBlockCounts, KvRouterError> {
         let (resp_tx, resp_rx) = oneshot::channel();
-        self.worker_lookup_stats_tx
-            .send(WorkerLookupStatsRequest { resp: resp_tx })
+        self.resident_block_counts_tx
+            .send(ResidentBlockCountsRequest { resp: resp_tx })
             .await
             .map_err(|_| KvRouterError::IndexerOffline)?;
         // A request sent while the actor drops its receiver stays queued with resp_tx alive.
         tokio::select! {
             resp = resp_rx => resp.map_err(|_| KvRouterError::IndexerDroppedRequest),
-            _ = self.worker_lookup_stats_tx.closed() => Err(KvRouterError::IndexerOffline),
+            _ = self.resident_block_counts_tx.closed() => Err(KvRouterError::IndexerOffline),
         }
     }
 }

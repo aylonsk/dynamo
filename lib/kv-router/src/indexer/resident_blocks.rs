@@ -10,10 +10,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwapOption, Guard};
 use rustc_hash::FxHashMap;
 
-use super::WorkerLookupStats;
 use crate::protocols::WorkerWithDpRank;
 
 /// How often routing hosts republish [`ResidentBlockCounts`].
@@ -33,10 +32,10 @@ impl ResidentBlockCounts {
     }
 }
 
-impl From<WorkerLookupStats> for ResidentBlockCounts {
-    fn from(stats: WorkerLookupStats) -> Self {
+impl FromIterator<(WorkerWithDpRank, usize)> for ResidentBlockCounts {
+    fn from_iter<I: IntoIterator<Item = (WorkerWithDpRank, usize)>>(iter: I) -> Self {
         let mut counts = FxHashMap::default();
-        for (worker, blocks) in stats.worker_blocks {
+        for (worker, blocks) in iter {
             *counts.entry(worker).or_default() += blocks as u64;
         }
         Self { counts }
@@ -50,9 +49,10 @@ pub(crate) struct ResidentBlockCountsHandle {
 }
 
 impl ResidentBlockCountsHandle {
-    /// The latest counts, or `None` before the first poll or after the poller stops.
-    pub(crate) fn load(&self) -> Option<Arc<ResidentBlockCounts>> {
-        self.latest.load_full()
+    /// The latest counts, or `None` before the first poll, while the indexer is backlogged, or
+    /// after the poller stops. Hold the guard only for one selection.
+    pub(crate) fn load(&self) -> Guard<Option<Arc<ResidentBlockCounts>>> {
+        self.latest.load()
     }
 
     #[cfg_attr(not(feature = "standalone-indexer"), allow(dead_code))]
@@ -60,7 +60,7 @@ impl ResidentBlockCountsHandle {
         self.latest.store(Some(Arc::new(counts)));
     }
 
-    /// Withdraw the counts so readers see `None` rather than a frozen snapshot.
+    /// Withdraw the counts so readers see `None` rather than stale counts.
     #[cfg_attr(not(feature = "standalone-indexer"), allow(dead_code))]
     pub(crate) fn clear(&self) {
         self.latest.store(None);

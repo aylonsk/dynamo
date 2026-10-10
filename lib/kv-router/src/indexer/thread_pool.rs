@@ -19,8 +19,8 @@ use super::concurrent_radix_tree_compressed::ConcurrentRadixTreeCompressed;
 use super::{
     ApproximateLruClient, ApproximateLruCommandSink, ApproximateLruIncarnation,
     ApproximateLruLease, ApproximateLruStats, ApproximateLruTask, ApproximateRetentionConfig,
-    KvIndexerInterface, KvIndexerMetrics, KvRouterError, ShardSizeSnapshot, SyncIndexer,
-    WorkerLookupStats, WorkerTask, panic_payload_message,
+    KvIndexerInterface, KvIndexerMetrics, KvRouterError, ResidentBlockCounts, ShardSizeSnapshot,
+    SyncIndexer, WorkerLookupStats, WorkerTask, panic_payload_message,
 };
 #[cfg(feature = "bench")]
 use super::{
@@ -82,6 +82,9 @@ pub struct ThreadPoolIndexer<T: SyncIndexer> {
 
     /// Handles to worker threads for joining on shutdown.
     thread_handles: Mutex<Vec<JoinHandle<()>>>,
+
+    /// Cancelled when the matching worker thread exits, including by panic.
+    thread_exited: Vec<tokio_util::sync::CancellationToken>,
 
     /// Approximate-mode TTL pruning manager. None for normal event-driven mode.
     prune_manager: Option<WorkerPruneManager>,
@@ -267,17 +270,21 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         let backend = Arc::new(backend);
         let mut worker_event_senders = Vec::new();
         let mut thread_handles = Vec::new();
+        let mut thread_exited = Vec::new();
         let worker_assignments = Arc::new(DashMap::with_hasher(FxBuildHasher));
         let worker_assignment_count = Arc::new(AtomicUsize::new(0));
         let synthetic_event_id = Arc::new(AtomicU64::new(0));
         for worker_idx in 0..num_workers {
             let (event_sender, event_receiver) = flume::unbounded::<WorkerTask>();
             worker_event_senders.push(event_sender);
+            let exited = tokio_util::sync::CancellationToken::new();
+            thread_exited.push(exited.clone());
 
             let backend = Arc::clone(&backend);
             let metrics = metrics.clone();
 
             let handle = std::thread::spawn(move || {
+                let _exited = exited.drop_guard();
                 // This is observability, not recovery: if the worker panics, log
                 // through tracing and then preserve the panic for join().
                 let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -327,6 +334,7 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
             num_workers,
             kv_block_size,
             thread_handles: Mutex::new(thread_handles),
+            thread_exited,
             prune_manager,
             prune_pump_cancel,
             synthetic_event_id,
@@ -578,57 +586,46 @@ impl<T: SyncIndexer> ThreadPoolIndexer<T> {
         }
     }
 
-    pub(crate) async fn worker_lookup_stats(&self) -> WorkerLookupStats {
-        let mut receivers = Vec::new();
-        for channel in &self.worker_event_channels {
+    /// Each worker thread's per-rank block counts, or `None` for a thread that has exited.
+    async fn lane_lookup_stats(&self) -> Vec<Option<WorkerLookupStats>> {
+        let lanes = self.worker_event_channels.iter().zip(&self.thread_exited);
+        futures_util::future::join_all(lanes.map(|(channel, exited)| async move {
             let (resp_tx, resp_rx) = oneshot::channel();
-            if channel.send(WorkerTask::Stats(resp_tx)).is_ok() {
-                receivers.push(resp_rx);
+            channel.send(WorkerTask::Stats(resp_tx)).ok()?;
+            // A thread that exits with this request queued neither answers nor drops it, since
+            // our own senders keep its queue alive.
+            tokio::select! {
+                biased;
+                stats = resp_rx => stats.ok(),
+                _ = exited.cancelled() => None,
             }
-        }
+        }))
+        .await
+    }
 
+    pub(crate) async fn worker_lookup_stats(&self) -> WorkerLookupStats {
         let mut worker_blocks = BTreeMap::new();
-        for receiver in receivers {
-            if let Ok(stats) = receiver.await {
-                for (worker, block_count) in stats.worker_blocks {
-                    *worker_blocks.entry(worker).or_insert(0usize) += block_count;
-                }
+        for stats in self.lane_lookup_stats().await.into_iter().flatten() {
+            for (worker, block_count) in stats.worker_blocks {
+                *worker_blocks.entry(worker).or_insert(0usize) += block_count;
             }
         }
-
         WorkerLookupStats::from_worker_block_counts(worker_blocks)
     }
 
-    /// Like [`Self::worker_lookup_stats`], but fails if an event thread is gone, so a caller
-    /// never mistakes a dead thread's ranks for empty ones. Each rank lives on one thread.
+    /// Per-rank block counts. Fails if a worker thread has exited, so a caller never mistakes a
+    /// dead thread's ranks for empty ones.
     #[cfg_attr(not(feature = "standalone-indexer"), allow(dead_code))]
-    pub(crate) async fn try_worker_lookup_stats(&self) -> Result<WorkerLookupStats, KvRouterError> {
-        let mut receivers = Vec::with_capacity(self.worker_event_channels.len());
-        for channel in &self.worker_event_channels {
-            let (resp_tx, resp_rx) = oneshot::channel();
-            channel
-                .send(WorkerTask::Stats(resp_tx))
-                .map_err(|_| KvRouterError::IndexerOffline)?;
-            receivers.push(resp_rx);
+    pub(crate) async fn resident_block_counts(&self) -> Result<ResidentBlockCounts, KvRouterError> {
+        let lanes = self.lane_lookup_stats().await;
+        if lanes.iter().any(Option::is_none) {
+            return Err(KvRouterError::IndexerOffline);
         }
-        let mut worker_blocks = Vec::new();
-        for (channel, mut receiver) in self.worker_event_channels.iter().zip(receivers) {
-            // A lane that dies with this request queued neither answers nor drops it, since our
-            // own senders keep the queue alive, so check for the dead lane while waiting.
-            let stats = loop {
-                match tokio::time::timeout(std::time::Duration::from_millis(50), &mut receiver)
-                    .await
-                {
-                    Ok(reply) => break reply.map_err(|_| KvRouterError::IndexerDroppedRequest)?,
-                    Err(_) if channel.is_disconnected() => {
-                        return Err(KvRouterError::IndexerOffline);
-                    }
-                    Err(_) => {}
-                }
-            };
-            worker_blocks.extend(stats.worker_blocks);
-        }
-        Ok(WorkerLookupStats { worker_blocks })
+        Ok(lanes
+            .into_iter()
+            .flatten()
+            .flat_map(|stats| stats.worker_blocks)
+            .collect())
     }
 
     pub async fn get_workers(&self) -> Vec<WorkerId> {
@@ -1608,25 +1605,49 @@ mod tests {
         assert_score(&indexer, &[20], rank1, 1).await;
     }
 
-    #[tokio::test]
-    async fn strict_stats_fail_when_a_lane_dies_with_the_request_queued() {
-        let indexer = ThreadPoolIndexer::new(ConcurrentRadixTreeCompressed::new(), 2, 16);
-        // Keep lane 0 busy so the stats request queues behind its Terminate.
-        for block in 0..20_000u64 {
-            indexer
-                .apply_event(make_store_event_with_dp_rank(7, &[block, block + 1], 0))
-                .await;
+    /// Holds each worker thread until the gate's sender drops, so a test can queue tasks behind
+    /// `Terminate`.
+    struct GatedBackend(flume::Receiver<()>);
+
+    impl SyncIndexer for GatedBackend {
+        fn worker(
+            &self,
+            tasks: flume::Receiver<WorkerTask>,
+            _metrics: Option<Arc<KvIndexerMetrics>>,
+        ) -> anyhow::Result<()> {
+            let _ = self.0.recv();
+            while let Ok(task) = tasks.recv() {
+                if let WorkerTask::Terminate = task {
+                    break;
+                }
+            }
+            Ok(())
         }
+
+        fn find_matches(&self, _sequence: &[LocalBlockHash], _early_exit: bool) -> OverlapScores {
+            OverlapScores::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_reads_fail_when_a_thread_exits_with_them_queued() {
+        let (open_gate, gate) = flume::bounded::<()>(1);
+        let indexer = ThreadPoolIndexer::new(GatedBackend(gate), 1, 16);
         indexer.worker_event_channels[0]
             .send(WorkerTask::Terminate)
             .unwrap();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            indexer.try_worker_lookup_stats(),
-        )
-        .await
-        .expect("a dead lane must not hang the read");
-        assert!(read.is_err());
+        // Both requests queue behind Terminate before the gate opens, so neither is answered.
+        let timeout = std::time::Duration::from_secs(5);
+        let (strict, lenient, ()) = tokio::join!(
+            tokio::time::timeout(timeout, indexer.resident_block_counts()),
+            tokio::time::timeout(timeout, indexer.worker_lookup_stats()),
+            async {
+                tokio::task::yield_now().await;
+                drop(open_gate);
+            },
+        );
+        assert!(strict.expect("strict read hung").is_err());
+        assert_eq!(lenient.expect("lenient read hung").worker_count(), 0);
     }
 
     #[tokio::test]

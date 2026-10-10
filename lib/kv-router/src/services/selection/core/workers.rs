@@ -331,14 +331,21 @@ impl SelectionCore {
                     self.worker_type,
                     key.as_ref(),
                 );
+                // Checked per partition, since the factory may build a different policy for each.
+                let inputs = selector.declared_inputs();
+                if inputs.contains(WorkerInputs::RESIDENT_BLOCKS)
+                    && !inputs.contains(WorkerInputs::CACHE)
+                {
+                    return Err(SelectionError::BadRequest(format!(
+                        "RESIDENT_BLOCKS requires the worker-selection policy for {key} to declare WorkerInputs::CACHE"
+                    )));
+                }
                 let profile = self
                     .kv_router_config
                     .policy_profile(Some(&key.model_name))
                     .map_err(|error| SelectionError::BadRequest(error.to_string()))?;
                 // Poll this partition's indexer only for a policy that reads the counts.
-                if selector
-                    .declared_inputs()
-                    .contains(WorkerInputs::RESIDENT_BLOCKS)
+                if inputs.contains(WorkerInputs::RESIDENT_BLOCKS)
                     && let Some(counts) = indexer.spawn_resident_block_counts_poller(
                         RESIDENT_BLOCK_COUNTS_POLL_INTERVAL,
                         self.cancel_token.child_token(),

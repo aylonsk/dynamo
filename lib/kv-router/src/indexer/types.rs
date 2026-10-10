@@ -571,9 +571,9 @@ pub struct GetWorkersRequest {
 }
 
 /// A request for the number of blocks tracked for each worker rank
-pub(crate) struct WorkerLookupStatsRequest {
+pub(crate) struct ResidentBlockCountsRequest {
     /// Channel to send the per-rank block counts
-    pub resp: oneshot::Sender<WorkerLookupStats>,
+    pub resp: oneshot::Sender<super::ResidentBlockCounts>,
 }
 
 #[derive(Debug, Default)]

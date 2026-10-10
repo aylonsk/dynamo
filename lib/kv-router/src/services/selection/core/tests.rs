@@ -734,15 +734,15 @@ fn capturing_policy_factory() -> (
     (factory, observed)
 }
 
-/// Picker that records the resident block count of row 0 and takes it.
+/// Picker that declares `inputs`, records the resident block count of row 0, and takes it.
 struct ResidentBlocksRecorder {
+    inputs: crate::scheduling::selector::WorkerInputs,
     observed: Arc<parking_lot::Mutex<Vec<Option<u64>>>>,
 }
 
 impl crate::scheduling::selector::WorkerPicker for ResidentBlocksRecorder {
     fn required_worker_inputs(&self) -> crate::scheduling::selector::WorkerInputs {
-        crate::scheduling::selector::WorkerInputs::CACHE
-            | crate::scheduling::selector::WorkerInputs::RESIDENT_BLOCKS
+        self.inputs
     }
 
     fn pick(
@@ -755,8 +755,9 @@ impl crate::scheduling::selector::WorkerPicker for ResidentBlocksRecorder {
     }
 }
 
-#[tokio::test]
-async fn declaring_policy_reads_polled_resident_blocks() {
+fn resident_blocks_core(
+    inputs: crate::scheduling::selector::WorkerInputs,
+) -> (SelectionCore, Arc<parking_lot::Mutex<Vec<Option<u64>>>>) {
     let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let factory_observed = Arc::clone(&observed);
     let factory: WorkerSelectionPolicyFactory = Arc::new(move |config, worker_type, _partition| {
@@ -765,6 +766,7 @@ async fn declaring_policy_reads_polled_resident_blocks() {
             worker_type.as_str(),
             Vec::new(),
             Box::new(ResidentBlocksRecorder {
+                inputs,
                 observed: Arc::clone(&factory_observed),
             }),
         )
@@ -775,6 +777,15 @@ async fn declaring_policy_reads_polled_resident_blocks() {
         Some(factory),
         WorkerType::Aggregated,
         None,
+    );
+    (core, observed)
+}
+
+#[tokio::test]
+async fn declaring_policy_reads_polled_resident_blocks() {
+    let (core, observed) = resident_blocks_core(
+        crate::scheduling::selector::WorkerInputs::CACHE
+            | crate::scheduling::selector::WorkerInputs::RESIDENT_BLOCKS,
     );
     core.upsert_worker(worker_with_kv_events(1))
         .await
@@ -805,6 +816,25 @@ async fn declaring_policy_reads_polled_resident_blocks() {
     })
     .await
     .expect("a declaring policy should read the polled count");
+}
+
+#[tokio::test]
+async fn partition_rejects_resident_blocks_without_cache() {
+    let (core, _) =
+        resident_blocks_core(crate::scheduling::selector::WorkerInputs::RESIDENT_BLOCKS);
+    let record = core
+        .upsert_worker(worker_with_kv_events(1))
+        .await
+        .expect("worker upsert");
+    assert_eq!(record.lifecycle, WorkerLifecycle::Incomplete);
+    assert!(
+        record
+            .not_schedulable_reasons
+            .iter()
+            .any(|reason| reason.contains("WorkerInputs::CACHE")),
+        "{:?}",
+        record.not_schedulable_reasons
+    );
 }
 
 type SharedCacheCalls = Arc<parking_lot::Mutex<Vec<(Vec<u32>, u32, Option<String>)>>>;

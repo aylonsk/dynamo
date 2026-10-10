@@ -72,7 +72,7 @@ impl<'a> WorkerCandidate<'a> {
     /// Blocks the router's indexer tracks for this worker rank, only when this component declared
     /// RESIDENT_BLOCKS: device blocks from KV events, or the router's prediction in approximate
     /// modes. Refreshed off the request path, unweighted, and not clamped to capacity; 0 also covers
-    /// ranks with no data yet. None means access was not requested or the host has no counts.
+    /// ranks with no data yet. None means access was not requested or the host has no fresh counts.
     pub fn resident_blocks(self) -> Option<u64> {
         if !self.inputs.contains(WorkerInputs::RESIDENT_BLOCKS) {
             return None;
@@ -155,7 +155,7 @@ impl WorkerInputs {
     /// Request preferred-taint routing metadata.
     pub const PREFERRED_TAINT: Self = Self(1 << 2);
     /// Request per-rank counts of blocks the router's indexer tracks (routing predictions in
-    /// approximate modes). The frontend rejects RESIDENT_BLOCKS without CACHE.
+    /// approximate modes). Requires CACHE.
     pub const RESIDENT_BLOCKS: Self = Self(1 << 3);
     /// Request host-owned active-request counts.
     pub const OCCUPANCY: Self = Self(1 << 5);

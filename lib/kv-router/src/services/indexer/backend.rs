@@ -876,16 +876,16 @@ impl Indexer {
     /// request path.
     #[cfg_attr(not(feature = "standalone-selection"), allow(dead_code))]
     async fn resident_block_counts(&self) -> Result<Option<ResidentBlockCounts>, KvRouterError> {
-        let stats = match self {
-            Self::Single { primary, .. } => primary.worker_lookup_stats().await?,
-            Self::Concurrent { primary, .. } => primary.try_worker_lookup_stats().await?,
-            Self::Remote { .. } | Self::None => return Ok(None),
-        };
-        Ok(Some(stats.into()))
+        match self {
+            Self::Single { primary, .. } => primary.resident_block_counts().await.map(Some),
+            Self::Concurrent { primary, .. } => primary.resident_block_counts().await.map(Some),
+            Self::Remote { .. } | Self::None => Ok(None),
+        }
     }
 
     /// Republish [`Self::resident_block_counts`] every `interval` until `cancel` fires or the
-    /// primary stops answering, then withdraw them. `None` without a local primary.
+    /// primary stops answering, then withdraw them. A read slower than three intervals also
+    /// withdraws them until a read answers in time. `None` without a local primary.
     #[cfg_attr(not(feature = "standalone-selection"), allow(dead_code))]
     pub(crate) fn spawn_resident_block_counts_poller(
         &self,
@@ -896,36 +896,71 @@ impl Indexer {
             return None;
         }
         let handle = ResidentBlockCountsHandle::default();
-        let published = handle.clone();
         let indexer = self.clone();
-        tokio::spawn(async move {
-            let poll = async {
-                let mut ticks = tokio::time::interval(interval);
-                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    ticks.tick().await;
-                    match indexer.resident_block_counts().await {
-                        Ok(Some(counts)) => published.publish(counts),
-                        Ok(None) => return,
-                        Err(error) => {
-                            // Debug: the indexer logs its own failure, and an ordinary shutdown
-                            // can stop the indexer before this task's cancel fires.
-                            tracing::debug!(%error, "Stopped publishing resident block counts");
-                            return;
-                        }
+        let read = move || {
+            let indexer = indexer.clone();
+            async move { indexer.resident_block_counts().await }
+        };
+        tokio::spawn(publish_resident_block_counts(
+            read,
+            handle.clone(),
+            interval,
+            cancel,
+        ));
+        Some(handle)
+    }
+}
+
+/// The loop behind [`Indexer::spawn_resident_block_counts_poller`], with the read injected for tests.
+#[cfg_attr(not(feature = "standalone-selection"), allow(dead_code))]
+async fn publish_resident_block_counts<F, Fut>(
+    mut read: F,
+    published: ResidentBlockCountsHandle,
+    interval: Duration,
+    cancel: CancellationToken,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<ResidentBlockCounts>, KvRouterError>>,
+{
+    let deadline = interval * 3;
+    let poll = async {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticks.tick().await;
+            let pending = read();
+            tokio::pin!(pending);
+            let result = match tokio::time::timeout(deadline, &mut pending).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Backlogged: withdraw the counts and let this read finish rather than queue
+                    // more behind the backlog. Only a read that meets the deadline republishes.
+                    published.clear();
+                    match pending.await {
+                        Ok(Some(_)) => continue,
+                        result => result,
                     }
                 }
             };
-            // Biased, so a cancel that races a read failed by the same shutdown wins.
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {}
-                _ = poll => {}
+            match result {
+                Ok(Some(counts)) => published.publish(counts),
+                Ok(None) => return,
+                Err(error) => {
+                    // Debug: the indexer logs its own failure, and an ordinary shutdown
+                    // can stop the indexer before this task's cancel fires.
+                    tracing::debug!(%error, "Stopped publishing resident block counts");
+                    return;
+                }
             }
-            published.clear();
-        });
-        Some(handle)
+        }
+    };
+    // Biased, so a cancel that races a read failed by the same shutdown wins.
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {}
+        _ = poll => {}
     }
+    published.clear();
 }
 
 #[async_trait]
@@ -1714,7 +1749,13 @@ mod tests {
                 0,
             ))
             .await;
-        wait_until(|| handle.load().is_some_and(|counts| counts.get(worker) == 2)).await;
+        wait_until(|| {
+            handle
+                .load()
+                .as_ref()
+                .is_some_and(|counts| counts.get(worker) == 2)
+        })
+        .await;
 
         cancel.cancel();
         wait_until(|| handle.load().is_none()).await;
@@ -1739,6 +1780,42 @@ mod tests {
             // A dead primary reads as None, not as a frozen or all-zero snapshot.
             wait_until(|| handle.load().is_none()).await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resident_block_counts_withdraw_while_a_read_misses_the_deadline() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let published = ResidentBlockCountsHandle::default();
+        let mut reads = 0;
+        let read = move || {
+            reads += 1;
+            let blocks = reads;
+            async move {
+                // The second read waits behind a backlog, past the 300 ms deadline.
+                if blocks == 2 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Ok(Some([(worker, blocks)].into_iter().collect()))
+            }
+        };
+        tokio::spawn(publish_resident_block_counts(
+            read,
+            published.clone(),
+            Duration::from_millis(100),
+            CancellationToken::new(),
+        ));
+        let held = || published.load().as_ref().map(|counts| counts.get(worker));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(held(), Some(1));
+        // The second read starts at 100 ms, so its deadline passes at 400 ms.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(held(), Some(1), "within the deadline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(held(), None, "past the deadline");
+        // The late read ends at 1.1 s and is dropped; the next read answers in time.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(held(), Some(3));
     }
 
     #[tokio::test]
